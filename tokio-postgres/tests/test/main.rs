@@ -206,14 +206,7 @@ async fn custom_enum() {
 
     let ty = &select.params()[0];
     assert_eq!("mood", ty.name());
-    assert_eq!(
-        &Kind::Enum(vec![
-            "sad".to_string(),
-            "ok".to_string(),
-            "happy".to_string(),
-        ]),
-        ty.kind(),
-    );
+    assert_eq!(&Kind::Enum, ty.kind(),);
 }
 
 #[tokio::test]
@@ -303,7 +296,6 @@ async fn custom_range() {
 }
 
 #[tokio::test]
-#[allow(clippy::get_first)]
 async fn simple_query() {
     let client = connect("user=postgres").await;
 
