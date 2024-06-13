@@ -13,7 +13,6 @@ use postgres_protocol::authentication::sasl;
 use postgres_protocol::authentication::sasl::ScramSha256;
 use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
 use postgres_protocol::message::frontend;
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
@@ -82,14 +81,13 @@ where
 pub async fn connect_raw<S, T>(
     stream: S,
     tls: T,
-    has_hostname: bool,
     config: &Config,
 ) -> Result<(Client, Connection<S, T::Stream>), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: TlsConnect<S>,
 {
-    let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
+    let stream = connect_tls(stream, config.ssl_mode, tls).await?;
 
     let mut stream = StartupStream {
         inner: Framed::new(stream, PostgresCodec),
@@ -97,33 +95,32 @@ where
         delayed: VecDeque::new(),
     };
 
-    let user = config
-        .user
-        .as_deref()
-        .map_or_else(|| Cow::Owned(whoami::username()), Cow::Borrowed);
-
-    startup(&mut stream, config, &user).await?;
-    authenticate(&mut stream, config, &user).await?;
+    startup(&mut stream, config).await?;
+    authenticate(&mut stream, config).await?;
     let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
 
     let (sender, receiver) = mpsc::unbounded();
-    let client = Client::new(sender, config.ssl_mode, process_id, secret_key);
+    let client = Client::new(
+        sender,
+        config.ssl_mode,
+        process_id,
+        secret_key,
+        config.pgbouncer_mode,
+    );
     let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
 
     Ok((client, connection))
 }
 
-async fn startup<S, T>(
-    stream: &mut StartupStream<S, T>,
-    config: &Config,
-    user: &str,
-) -> Result<(), Error>
+async fn startup<S, T>(stream: &mut StartupStream<S, T>, config: &Config) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut params = vec![("client_encoding", "UTF8")];
-    params.push(("user", user));
+    if let Some(user) = &config.user {
+        params.push(("user", &**user));
+    }
     if let Some(dbname) = &config.dbname {
         params.push(("database", &**dbname));
     }
@@ -143,11 +140,7 @@ where
         .map_err(Error::io)
 }
 
-async fn authenticate<S, T>(
-    stream: &mut StartupStream<S, T>,
-    config: &Config,
-    user: &str,
-) -> Result<(), Error>
+async fn authenticate<S, T>(stream: &mut StartupStream<S, T>, config: &Config) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: TlsStream + Unpin,
@@ -170,6 +163,10 @@ where
         Some(Message::AuthenticationMd5Password(body)) => {
             can_skip_channel_binding(config)?;
 
+            let user = config
+                .user
+                .as_ref()
+                .ok_or_else(|| Error::config("user missing".into()))?;
             let pass = config
                 .password
                 .as_ref()
