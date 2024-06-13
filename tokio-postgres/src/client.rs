@@ -1,4 +1,6 @@
 use crate::codec::{BackendMessages, FrontendMessage};
+#[cfg(feature = "runtime")]
+use crate::config::Host;
 use crate::config::SslMode;
 use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
@@ -25,10 +27,6 @@ use postgres_protocol::message::{backend::Message, frontend};
 use postgres_types::BorrowToSql;
 use std::collections::HashMap;
 use std::fmt;
-#[cfg(feature = "runtime")]
-use std::net::IpAddr;
-#[cfg(feature = "runtime")]
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 #[cfg(feature = "runtime")]
@@ -83,6 +81,7 @@ struct CachedTypeInfo {
 
 pub struct InnerClient {
     sender: mpsc::UnboundedSender<Request>,
+    pgbouncer_mode: bool,
     cached_typeinfo: Mutex<CachedTypeInfo>,
 
     /// A buffer to use when writing out postgres commands.
@@ -104,35 +103,59 @@ impl InnerClient {
     }
 
     pub fn typeinfo(&self) -> Option<Statement> {
-        self.cached_typeinfo.lock().typeinfo.clone()
+        if self.pgbouncer_mode {
+            None
+        } else {
+            self.cached_typeinfo.lock().typeinfo.clone()
+        }
     }
 
     pub fn set_typeinfo(&self, statement: &Statement) {
-        self.cached_typeinfo.lock().typeinfo = Some(statement.clone());
+        if !self.pgbouncer_mode {
+            self.cached_typeinfo.lock().typeinfo = Some(statement.clone());
+        }
     }
 
     pub fn typeinfo_composite(&self) -> Option<Statement> {
-        self.cached_typeinfo.lock().typeinfo_composite.clone()
+        if self.pgbouncer_mode {
+            None
+        } else {
+            self.cached_typeinfo.lock().typeinfo_composite.clone()
+        }
     }
 
     pub fn set_typeinfo_composite(&self, statement: &Statement) {
-        self.cached_typeinfo.lock().typeinfo_composite = Some(statement.clone());
+        if !self.pgbouncer_mode {
+            self.cached_typeinfo.lock().typeinfo_composite = Some(statement.clone());
+        }
     }
 
     pub fn typeinfo_enum(&self) -> Option<Statement> {
-        self.cached_typeinfo.lock().typeinfo_enum.clone()
+        if self.pgbouncer_mode {
+            None
+        } else {
+            self.cached_typeinfo.lock().typeinfo_enum.clone()
+        }
     }
 
     pub fn set_typeinfo_enum(&self, statement: &Statement) {
-        self.cached_typeinfo.lock().typeinfo_enum = Some(statement.clone());
+        if !self.pgbouncer_mode {
+            self.cached_typeinfo.lock().typeinfo_enum = Some(statement.clone());
+        }
     }
 
     pub fn type_(&self, oid: Oid) -> Option<Type> {
-        self.cached_typeinfo.lock().types.get(&oid).cloned()
+        if self.pgbouncer_mode {
+            None
+        } else {
+            self.cached_typeinfo.lock().types.get(&oid).cloned()
+        }
     }
 
     pub fn set_type(&self, oid: Oid, type_: &Type) {
-        self.cached_typeinfo.lock().types.insert(oid, type_.clone());
+        if !self.pgbouncer_mode {
+            self.cached_typeinfo.lock().types.insert(oid, type_.clone());
+        }
     }
 
     pub fn clear_type_cache(&self) {
@@ -155,20 +178,10 @@ impl InnerClient {
 #[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub(crate) struct SocketConfig {
-    pub addr: Addr,
-    pub hostname: Option<String>,
+    pub host: Host,
     pub port: u16,
     pub connect_timeout: Option<Duration>,
-    pub tcp_user_timeout: Option<Duration>,
     pub keepalive: Option<KeepaliveConfig>,
-}
-
-#[cfg(feature = "runtime")]
-#[derive(Clone)]
-pub(crate) enum Addr {
-    Tcp(IpAddr),
-    #[cfg(unix)]
-    Unix(PathBuf),
 }
 
 /// An asynchronous PostgreSQL client.
@@ -190,10 +203,12 @@ impl Client {
         ssl_mode: SslMode,
         process_id: i32,
         secret_key: i32,
+        pgbouncer_mode: bool,
     ) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
+                pgbouncer_mode,
                 cached_typeinfo: Default::default(),
                 buffer: Default::default(),
             }),
@@ -242,6 +257,10 @@ impl Client {
     /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     pub async fn query<T>(
         &self,
         statement: &T,
@@ -266,6 +285,10 @@ impl Client {
     /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     pub async fn query_one<T>(
         &self,
         statement: &T,
@@ -274,9 +297,19 @@ impl Client {
     where
         T: ?Sized + ToStatement,
     {
-        self.query_opt(statement, params)
-            .await
-            .and_then(|res| res.ok_or_else(Error::row_count))
+        let stream = self.query_raw(statement, slice_iter(params)).await?;
+        pin_mut!(stream);
+
+        let row = match stream.try_next().await? {
+            Some(row) => row,
+            None => return Err(Error::row_count()),
+        };
+
+        if stream.try_next().await?.is_some() {
+            return Err(Error::row_count());
+        }
+
+        Ok(row)
     }
 
     /// Executes a statements which returns zero or one rows, returning it.
@@ -289,6 +322,10 @@ impl Client {
     /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     pub async fn query_opt<T>(
         &self,
         statement: &T,
@@ -300,22 +337,16 @@ impl Client {
         let stream = self.query_raw(statement, slice_iter(params)).await?;
         pin_mut!(stream);
 
-        let mut first = None;
+        let row = match stream.try_next().await? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
 
-        // Originally this was two calls to `try_next().await?`,
-        // once for the first element, and second to error if more than one.
-        //
-        // However, this new form with only one .await in a loop generates
-        // slightly smaller codegen/stack usage for the resulting future.
-        while let Some(row) = stream.try_next().await? {
-            if first.is_some() {
-                return Err(Error::row_count());
-            }
-
-            first = Some(row);
+        if stream.try_next().await?.is_some() {
+            return Err(Error::row_count());
         }
 
-        Ok(first)
+        Ok(Some(row))
     }
 
     /// The maximally flexible version of [`query`].
@@ -326,6 +357,10 @@ impl Client {
     /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`query`]: #method.query
     ///
@@ -374,6 +409,10 @@ impl Client {
     /// with the `prepare` method.
     ///
     /// If the statement does not modify any rows (e.g. `SELECT`), 0 is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     pub async fn execute<T>(
         &self,
         statement: &T,
@@ -394,6 +433,10 @@ impl Client {
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
     ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
+    ///
     /// [`execute`]: #method.execute
     pub async fn execute_raw<T, P, I>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
@@ -410,6 +453,10 @@ impl Client {
     ///
     /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any. The copy *must*
     /// be explicitly completed via the `Sink::close` or `finish` methods. If it is not, the copy will be aborted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement contains parameters.
     pub async fn copy_in<T, U>(&self, statement: &T) -> Result<CopyInSink<U>, Error>
     where
         T: ?Sized + ToStatement,
@@ -422,6 +469,10 @@ impl Client {
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
     ///
     /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement contains parameters.
     pub async fn copy_out<T>(&self, statement: &T) -> Result<CopyOutStream, Error>
     where
         T: ?Sized + ToStatement,
